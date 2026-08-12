@@ -1,0 +1,350 @@
+name: QAIC Testcases
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build qaic and compile testcases
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install system dependencies
+        run: |
+          # arm64 isn't in the main Ubuntu archive (it lives on ports.ubuntu.com), so
+          # scope the existing archive entries to the architecture they actually
+          # carry and add a separate ports source for arm64 before enabling it as a
+          # foreign architecture. Otherwise `apt-get update` 404s trying to fetch
+          # arm64 indices from the main archive.
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          release="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          for suite in "$release" "$release-updates" "$release-security"; do
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $suite main universe"
+          done | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+
+          # gcc-aarch64-linux-gnu -> gcc-11-aarch64-linux-gnu was reproducibly failing
+          # as "unmet dependency" even though apt-cache policy/madison/showpkg confirmed
+          # valid candidates existed. showpkg's dependency listing for
+          # gcc-11-aarch64-linux-gnu references :i386-tagged sibling packages
+          # (gcc-11-aarch64-linux-gnu:i386, cpp-11-aarch64-linux-gnu:i386,
+          # gcc-multilib:i386) - those only enter the resolver's consideration once
+          # i386 is enabled as a foreign (multiarch) architecture via
+          # `dpkg --add-architecture i386`. So don't do that - matching upstream
+          # fastrpc's own CI (.github/workflows/build_linux_arm64.yml), which enables
+          # only arm64 as a foreign architecture and installs this exact gcc-cross
+          # package set fine.
+          #
+          # libc6-dev-i386 is still needed, though: it's what provides
+          # gnu/stubs-32.h, which the hexagon skel compile pulls in transitively
+          # (features.h -> gnu/stubs.h -> gnu/stubs-32.h, since --target=hexagon
+          # defines neither __x86_64__ nor __ILP32__, landing in stubs.h's 32-bit
+          # branch) through our x86-linux-gnu shim of x86_64-linux-gnu below. Unlike
+          # the real :i386 cross packages above, libc6-dev-i386 is itself an
+          # amd64-native package (Architecture: amd64) - it installs fine without
+          # ever enabling the i386 foreign architecture, so it doesn't reintroduce
+          # the resolver problem.
+          sudo apt-get install -y \
+            clang-14 lld-14 autoconf automake libtool libtool-bin make pkg-config \
+            libyaml-dev libbsd-dev libc6-dev-i386 \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libc6-dev-arm64-cross linux-libc-dev-arm64-cross \
+            libyaml-0-2:arm64 libyaml-dev:arm64 libbsd-dev:arm64
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 100
+          sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-14 100
+          clang --version
+          clang --print-targets
+
+          # The cross packages above give clang's Debian/Ubuntu multiarch-aware
+          # driver everything it needs to auto-detect a full aarch64 target
+          # environment (crt*.o, crtbeginS/crtendS.o, libgcc, libc) purely from
+          # --target=aarch64-linux-gnu, with libbsd-dev:arm64 supplying -lbsd from
+          # the matching /usr/lib/aarch64-linux-gnu multiarch dir. This is what the
+          # "test" stage's final clang link step needs (it links via clang as a
+          # driver, unlike skel/stub which link via raw ld.lld with no implicit
+          # libc/CRT).
+
+          # testcases/configure.ac hardcodes ARCHINC=/usr/include/x86-linux-gnu for
+          # x86_64 hosts (a fixed, tested-upstream file we don't modify), and reuses
+          # that same ARCHINC as an -I flag for every stage: the hexagon skel compile,
+          # and the aarch64-linux-gnu stub/test compiles. Ubuntu's real multiarch dir
+          # is /usr/include/x86_64-linux-gnu, so build a shim directory at the
+          # expected (typo'd) path that mirrors it via symlinks, EXCEPT for
+          # bits/wordsize.h: upstream glibc's version only sets __WORDSIZE 64 when
+          # __x86_64__ is defined, else falls back to 32. That fallback is correct
+          # for the hexagon skel compile (--target=hexagon really is 32-bit) but
+          # wrong for the aarch64 stub/test compiles (--target=aarch64-linux-gnu is
+          # 64-bit, yet defines neither __x86_64__ nor __aarch64__ get treated as
+          # 32-bit by the unmodified header), which made uintptr_t resolve as a
+          # 32-bit type and broke pointer casts in *_stub.c. Patch just that one
+          # header to also recognize __aarch64__ as 64-bit.
+          sudo mkdir -p /usr/include/x86-linux-gnu/bits
+          for entry in /usr/include/x86_64-linux-gnu/*; do
+            name="$(basename "$entry")"
+            if [ "$name" = "bits" ]; then
+              for f in "$entry"/*; do
+                fname="$(basename "$f")"
+                [ "$fname" = "wordsize.h" ] && continue
+                sudo ln -s "$f" "/usr/include/x86-linux-gnu/bits/$fname"
+              done
+            else
+              sudo ln -s "$entry" "/usr/include/x86-linux-gnu/$name"
+            fi
+          done
+          sudo tee /usr/include/x86-linux-gnu/bits/wordsize.h > /dev/null <<'EOF'
+          #ifndef _BITS_WORDSIZE_H
+          #define _BITS_WORDSIZE_H 1
+
+          #if (defined __x86_64__ && !defined __ILP32__) || defined __aarch64__
+          # define __WORDSIZE     64
+          #else
+          # define __WORDSIZE     32
+          # define __WORDSIZE32_SIZE_ULONG        0
+          # define __WORDSIZE32_PTRDIFF_LONG      0
+          #endif
+
+          #ifdef __x86_64__
+          # define __WORDSIZE_TIME64_COMPAT32    1
+          # define __SYSCALL_WORDSIZE            64
+          #else
+          # define __WORDSIZE_TIME64_COMPAT32    0
+          #endif
+
+          #endif
+          EOF
+
+      - name: Set up GHC and Cabal
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          ghc-version: '8.4.3'
+          cabal-version: '3.10.3.0'
+
+      - name: Build qaic
+        working-directory: src
+        run: |
+          cabal update
+          make
+          echo "$(pwd)/Linux_ReleaseG/ship" >> "$GITHUB_PATH"
+
+      - name: Verify qaic binary
+        run: qaic --version
+
+      - name: Build and install FastRPC
+        run: |
+          git clone --depth 1 https://github.com/qualcomm/fastrpc.git /tmp/fastrpc
+          cd /tmp/fastrpc
+
+          # Sanity checks straight from qualcomm/fastrpc's own CI
+          # (.github/workflows/build_linux_arm64.yml) - confirm the arm64 libyaml
+          # dev files this build needs are actually where pkg-config expects them.
+          ls -l /usr/include/yaml.h
+          ls -l /usr/lib/aarch64-linux-gnu/pkgconfig/yaml-0.1.pc
+          PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig pkg-config --cflags --libs yaml-0.1
+
+          # Build FastRPC exactly the way upstream's own CI builds it: same env
+          # vars, and ./gitcompile itself (rather than a hand-rolled
+          # autoreconf/configure/make) so we're running the identical
+          # autoreconf -is && ./configure "$@" && make sequence upstream uses,
+          # not a reimplementation of it.
+          export CC=aarch64-linux-gnu-gcc
+          export CXX=aarch64-linux-gnu-g++
+          export AS=aarch64-linux-gnu-as
+          export LD=aarch64-linux-gnu-ld
+          export RANLIB=aarch64-linux-gnu-ranlib
+          export STRIP=aarch64-linux-gnu-strip
+          export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+          ./gitcompile --host=aarch64-linux-gnu
+
+          # gitcompile stops at `make` (upstream's own CI only checks artifacts
+          # in-tree, e.g. src/.libs/libadsprpc.so). We need libcdsprpc.so and
+          # remote.h installed somewhere discoverable so the aarch64 stub/test
+          # stages can link/include them, so run the install ourselves - this is
+          # packaging, not a compilation step, so it doesn't deviate from
+          # upstream's actual build recipe above.
+          sudo make install
+
+          fastrpc_inc="$(dirname "$(find /usr/local/include -name remote.h -print -quit)")"
+          fastrpc_lib="$(dirname "$(find /usr/local/lib* -name 'libcdsprpc.so*' -print -quit)")"
+
+          if [ -z "$fastrpc_inc" ] || [ -z "$fastrpc_lib" ]; then
+            echo "Could not locate installed FastRPC headers/library" >&2
+            exit 1
+          fi
+
+          echo "FASTRPC_INC=$fastrpc_inc" >> "$GITHUB_ENV"
+          echo "FASTRPC_LIB_DIR=$fastrpc_lib" >> "$GITHUB_ENV"
+
+          # testcases/configure.ac hardcodes -I/usr/local/include/fastrpc/inc into
+          # SKEL_CFLAGS/STUB_CFLAGS (no env override hook, unlike TEST_CFLAGS), matching
+          # the layout produced by manually copying headers out of the Hexagon SDK. The
+          # public fastrpc repo's own `make install` puts them one level up at
+          # $(includedir)/fastrpc instead, so mirror that expected path here.
+          sudo mkdir -p /usr/local/include/fastrpc/inc
+          sudo cp "$fastrpc_inc"/*.h /usr/local/include/fastrpc/inc/
+
+      - name: Configure testcases
+        working-directory: testcases
+        run: |
+          autoreconf -fi
+          # TEST_LDFLAGS is an AC_ARG_VAR in configure.ac (default only applies if
+          # unset), so our override here is honored verbatim. The default omits any
+          # -fuse-ld flag, so clang falls back to the host's default GNU ld (BFD),
+          # which doesn't recognize the aarch64linux emulation needed to link the
+          # --target=aarch64-linux-gnu stub/test objects ("unrecognised emulation
+          # mode: aarch64linux"). skel/stub already link fine because their Makefile
+          # rules invoke ld.lld directly; make the final test-binary link use it too.
+          TEST_CFLAGS="-I$FASTRPC_INC" TEST_LDFLAGS="-fuse-ld=lld -L$FASTRPC_LIB_DIR -lcdsprpc" ./configure
+
+      - name: Build testcases and report
+        id: build_testcases
+        working-directory: testcases
+        continue-on-error: true
+        run: |
+          LOG_DIR="$(pwd)/build-logs"
+          mkdir -p "$LOG_DIR"
+
+          # clang treats -W flags positionally, so a leading -Wno-... on the
+          # command line gets re-enabled by the -Wall in each testcase's
+          # `test: CFLAGS = @TEST_CFLAGS@ ...`. Wrap clang so the suppression
+          # is appended *after* all forwarded args, guaranteeing it wins.
+          CLANG_TEST_WRAPPER="$(pwd)/clang-test-wrapper.sh"
+          printf '%s\n' '#!/usr/bin/env bash' 'exec clang "$@" -Wno-misleading-indentation' > "$CLANG_TEST_WRAPPER"
+          chmod +x "$CLANG_TEST_WRAPPER"
+
+          TESTCASES=()
+          for d in */; do
+            d="${d%/}"
+            [ -f "$d/Makefile.am" ] && TESTCASES+=("$d")
+          done
+
+          STAGES=(qaic skel stub test)
+          declare -A STATUS
+          declare -A FAIL_STAGE
+
+          for name in "${TESTCASES[@]}"; do
+            log="$LOG_DIR/$name.log"
+            : > "$log"
+            ok=1
+            for stage in "${STAGES[@]}"; do
+              echo "=== make $stage ($name) ===" >> "$log"
+              make_args=()
+              # complex_seq_test.c has a pre-existing misleading-indentation
+              # diagnostic upstream; suppress just that check for the test
+              # stage rather than patching testcase sources.
+              if [ "$stage" = "test" ]; then
+                make_args+=(CC="$CLANG_TEST_WRAPPER")
+              fi
+              if ! (cd "$name" && make "$stage" "${make_args[@]}") >> "$log" 2>&1; then
+                STATUS[$name]="FAIL"
+                FAIL_STAGE[$name]="$stage"
+                ok=0
+                break
+              fi
+            done
+            if [ "$ok" = "1" ]; then
+              STATUS[$name]="PASS"
+              FAIL_STAGE[$name]=""
+            fi
+            echo "${STATUS[$name]}" > "$LOG_DIR/$name.status"
+          done
+
+          {
+            printf "%-30s %-8s %s\n" "Testcase" "Status" "Stage"
+            printf '%s\n' "--------------------------------------------------"
+            pass_count=0
+            for name in "${TESTCASES[@]}"; do
+              printf "%-30s %-8s %s\n" "$name" "${STATUS[$name]}" "${FAIL_STAGE[$name]}"
+              [ "${STATUS[$name]}" = "PASS" ] && pass_count=$((pass_count + 1))
+            done
+            printf '%s\n' "--------------------------------------------------"
+            echo "$pass_count/${#TESTCASES[@]} passed"
+          } | tee "$LOG_DIR/summary.txt"
+
+          pass_count=0
+          for name in "${TESTCASES[@]}"; do
+            [ "${STATUS[$name]}" = "PASS" ] && pass_count=$((pass_count + 1))
+          done
+          echo "pass_count=$pass_count" >> "$GITHUB_OUTPUT"
+          echo "total_count=${#TESTCASES[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage binaries and generated sources for upload
+        if: always()
+        working-directory: testcases
+        run: |
+          ARTIFACT_DIR="$(pwd)/artifacts"
+          mkdir -p "$ARTIFACT_DIR/qaic_binary"
+          cp -v "$(command -v qaic)" "$ARTIFACT_DIR/qaic_binary/" 2>/dev/null || true
+
+          for d in */; do
+            name="${d%/}"
+            [ -f "$name/Makefile.am" ] || continue
+            out="$ARTIFACT_DIR/$name"
+            mkdir -p "$out/generated"
+            # qaic-generated skel/stub sources live at the testcase's top level,
+            # named after the module (see Makefile.am's SKEL_SRC/STUB_SRC).
+            cp -v "$name/${name}_skel.c" "$out/generated/" 2>/dev/null || true
+            cp -v "$name/${name}_stub.c" "$out/generated/" 2>/dev/null || true
+            cp -v "$name"/lib"${name}"_skel.so "$out/" 2>/dev/null || true
+            cp -v "$name"/lib"${name}"_stub.so "$out/" 2>/dev/null || true
+            cp -v "$name/${name}_test" "$out/" 2>/dev/null || true
+            # A testcase that failed before its qaic/skel/stub/test stage ran
+            # produced nothing here - drop the empty dirs so the upload stays clean.
+            rmdir "$out/generated" 2>/dev/null || true
+            rmdir "$out" 2>/dev/null || true
+          done
+
+      - name: Upload binaries and generated sources
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: testcase-binaries
+          path: testcases/artifacts/
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## QAIC testcases build report"
+            echo
+            echo '```'
+            cat testcases/build-logs/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Print the tail of every failing testcase's log inline so the actual
+          # compiler error is visible on the run's Summary page, without needing
+          # to download the build-logs artifact (which requires a signed-in
+          # GitHub session).
+          for log in testcases/build-logs/*.log; do
+            name="$(basename "$log" .log)"
+            if grep -q "^FAIL$" "testcases/build-logs/${name}.status" 2>/dev/null; then
+              {
+                echo
+                echo "<details><summary>${name} - last 60 log lines</summary>"
+                echo
+                echo '```'
+                tail -n 60 "$log"
+                echo '```'
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: testcase-build-logs
+          path: testcases/build-logs/
+
+      - name: Fail if any testcase failed
+        if: steps.build_testcases.outputs.pass_count != steps.build_testcases.outputs.total_count
+        run: |
+          echo "Not all testcases passed (${{ steps.build_testcases.outputs.pass_count }}/${{ steps.build_testcases.outputs.total_count }})"
+          exit 1
